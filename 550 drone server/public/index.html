@@ -7,7 +7,7 @@
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <style>
         body { margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #1a1a1a; color: white;}
-        #map { width: 100vw; height: 100vh; }
+        #map { width: 100vw; height: 100vh; transform-origin: center center; transition: transform 0.3s ease; }
         
         /* 浮動的戰情儀表板 */
         #dashboard {
@@ -38,6 +38,27 @@
             transform-origin: 50% 50%;
             transition: transform 0.2s linear; /* 讓轉向滑順 */
         }
+        /* 一鍵鎖定按鈕 */
+        #center-btn {
+            position: absolute;
+            bottom: 40px;
+            right: 20px;
+            z-index: 1000;
+            background-color: #00ffcc;
+            color: #000;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 30px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            box-shadow: 0 4px 15px rgba(0, 255, 204, 0.4);
+            transition: all 0.2s ease;
+        }
+        #center-btn:hover {
+            transform: scale(1.1);
+            background-color: #00ccaa;
+        }
     </style>
 </head>
 <body>
@@ -54,10 +75,11 @@
     </div>
 
     <div id="map"></div>
+    <button id="center-btn">🎯 鎖定空母</button>
 
     <script>
-        // 1. 初始化地圖 (預設定位在中央大學附近)
-        const map = L.map('map').setView([24.968, 121.195], 16);
+        // 1. 初始化地圖 (預設定位在台灣正中央)
+        const map = L.map('map').setView([23.6978, 120.9605], 7);
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
             attribution: '© OpenStreetMap contributors',
             maxZoom: 19
@@ -72,8 +94,37 @@
         });
 
         // 在地圖上放上無人機圖釘 (初始位置隱藏，等收到 GPS 才顯示)
-        let droneMarker = L.marker([24.968, 121.195], { icon: droneDivIcon, opacity: 0 }).addTo(map);
+        let droneMarker = L.marker([23.6978, 120.9605], { icon: droneDivIcon, opacity: 0 }).addTo(map);
         let isFirstLocation = true;
+        let currentDroneLatLng = null; // 用來隨時記住空母的最新座標
+        let currentDroneYaw = 0;
+        let isFollowing = true;
+
+        function setMapRotation(angle) {
+            const mapEl = document.getElementById('map');
+            mapEl.style.transform = `rotate(${-angle}deg)`;
+        }
+
+        function updateCenterButton() {
+            const btn = document.getElementById('center-btn');
+            if (isFollowing) {
+                btn.innerText = '🔒 跟隨空母';
+                btn.style.backgroundColor = '#00ffcc';
+                btn.style.color = '#000';
+            } else {
+                btn.innerText = '🎯 鎖定空母';
+                btn.style.backgroundColor = '#ffcc00';
+                btn.style.color = '#000';
+            }
+        }
+
+        map.on('dragstart zoomstart', () => {
+            if (isFollowing) {
+                isFollowing = false;
+                setMapRotation(0);
+                updateCenterButton();
+            }
+        });
 
         // =================================================================
         // 🚨 總工程師注意：已改成你的 Render 伺服器網址
@@ -114,6 +165,8 @@
                     // 2. 更新地圖上的圖釘位置
                     if (data.lat !== 0 && data.lon !== 0) {
                         const newLatLng = new L.LatLng(data.lat, data.lon);
+                        currentDroneLatLng = newLatLng; // 👈 每次收到新座標，就偷偷記下來
+                        currentDroneYaw = data.yaw;
                         droneMarker.setLatLng(newLatLng);
                         droneMarker.setOpacity(1); // 收到真實座標後顯示出來
 
@@ -123,10 +176,17 @@
                             isFirstLocation = false;
                         }
 
+                        if (isFollowing) {
+                            map.flyTo(newLatLng, 18, { animate: true, duration: 0.5 });
+                            setMapRotation(data.yaw);
+                        } else {
+                            setMapRotation(0);
+                        }
+
                         // 3. 旋轉機頭 (Yaw)
                         const arrow = document.getElementById('drone-arrow');
                         if (arrow) {
-                            // 加上一點 CSS 旋轉魔法，讓箭頭指向真實的 Yaw 角度
+                            // arrow 旋轉成真實航向，讓鎖定時畫面也能朝上
                             arrow.style.transform = `rotate(${data.yaw}deg)`;
                         }
                     }
@@ -143,6 +203,31 @@
             };
         }
 
+        // 綁定「鎖定空母」按鈕的點擊事件
+        document.getElementById('center-btn').addEventListener('click', () => {
+            if (currentDroneLatLng) {
+                isFollowing = true;
+                updateCenterButton();
+                setMapRotation(currentDroneYaw);
+                map.flyTo(currentDroneLatLng, 18, {
+                    animate: true,
+                    duration: 1.2
+                });
+            } else {
+                const btn = document.getElementById('center-btn');
+                const originalText = btn.innerText;
+                btn.innerText = '⚠️ 尚未定位';
+                btn.style.backgroundColor = '#ff3366';
+                btn.style.color = 'white';
+                setTimeout(() => {
+                    btn.innerText = originalText;
+                    btn.style.backgroundColor = '#00ffcc';
+                    btn.style.color = '#000';
+                }, 2000);
+            }
+        });
+
+        updateCenterButton();
         // 啟動連線！
         connectWebSocket();
     </script>

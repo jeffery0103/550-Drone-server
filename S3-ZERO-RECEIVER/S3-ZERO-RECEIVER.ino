@@ -8,7 +8,11 @@
 #include <RF24.h>
 #define TINY_GSM_MODEM_SIM7600
 #include <TinyGsmClient.h>
-#include <PubSubClient.h>
+#if __has_include(<TinyGsmClientSecure.h>)
+#include <TinyGsmClientSecure.h>
+#define HAS_TINY_GSM_SECURE
+#endif
+#include <WebSocketsClient.h>
 
 #define RGB_PIN 21 
 #define NUMPIXELS 1
@@ -28,11 +32,16 @@ HardwareSerial SerialModem(1);
 HardwareSerial SerialFC(2);
 RF24 radio(NRF_CE, NRF_CSN);
 TinyGsm modem(SerialModem);
-TinyGsmClient client(modem);
-PubSubClient mqtt(client);
+#ifdef HAS_TINY_GSM_SECURE
+TinyGsmClientSecure secureClient(modem);
+#else
+TinyGsmClient secureClient(modem); // fallback if secure header not available
+#endif
+WebSocketsClient webSocket;
 
-const char* broker = "broker.emqx.io";
-const char* topic  = "Jeffery/550/telemetry";
+const char* wsHost = "five50-drone-telemetry.onrender.com";
+const uint16_t wsPort = 443;
+const char* wsPath = "/";
 const byte address[6] = "00001";
 
 struct __attribute__((packed)) Control_Packet {
@@ -73,7 +82,7 @@ uint8_t msp_rx_index = 0;
 unsigned long lastSignalTime = 0; 
 unsigned long lastRcTime = 0;
 unsigned long lastMspReqTime = 0;
-unsigned long lastMqttTime = 0;
+unsigned long lastWebSocketTime = 0;
 unsigned long lastNetworkCheckTime = 0; 
 unsigned long mspDelayTimer = 0;
 unsigned long lastDebugPrintTime = 0; // 👈 新增：除錯列印計時器
@@ -90,7 +99,8 @@ unsigned long ch8_trigger_time = 0;
 
 // 🔧 核心 1 專用變數
 SemaphoreHandle_t modem_mutex = NULL;
-volatile bool mqttConnectedState = false;
+SemaphoreHandle_t data_mutex = NULL;
+volatile bool webSocketConnectedState = false;
 volatile bool gprsConnectedState = false;
 
 void debugLog(const char* tag, const char* msg) {
@@ -107,15 +117,37 @@ void debugLog(const char* tag, const char* key, const char* value) {
   Serial.print(key); Serial.print(": "); Serial.println(value);
 }
 
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
+      debugLog("[核心 1]", "WebSocket", "已連線");
+      webSocketConnectedState = true;
+      break;
+    case WStype_DISCONNECTED:
+      debugLog("[核心 1]", "WebSocket", "已斷線");
+      webSocketConnectedState = false;
+      break;
+    case WStype_ERROR:
+      debugLog("[核心 1]", "WebSocket", "發生錯誤");
+      webSocketConnectedState = false;
+      break;
+    case WStype_TEXT:
+      // 目前不需要處理來自伺服器的文字回傳
+      break;
+    default:
+      break;
+  }
+}
+
 void core1_modem_task(void* pvParameters) {
-  // 核心 1：純粹處理 4G / MQTT，完全不會阻塞核心 0 的 NRF24
-  debugLog("[核心 1]", "4G/MQTT 背景任務已啟動");
+  // 核心 1：純粹處理 4G / WebSocket，完全不會阻塞核心 0 的 NRF24
+  debugLog("[核心 1]", "4G/WebSocket 背景任務已啟動");
   
   unsigned long lastNetworkCheck = 0;
-  unsigned long lastMqttLoop = 0;
   
   bool lastGprsConnected = false;
-  bool lastMqttConnected = false;
+  bool lastWebSocketConnected = false;
+  unsigned long lastWebSocketLoop = 0;
 
   while (true) {
     unsigned long now = millis();
@@ -147,35 +179,53 @@ void core1_modem_task(void* pvParameters) {
         debugLog("[核心 1]", "modem_mutex", "取鎖失敗");
       }
     }
-    
-    // ⏱️ 每 1 秒呼叫一次 mqtt.loop()（必須在鎖內執行，且只能這裡呼叫）
-    if (now - lastMqttLoop > 1000) {
-      lastMqttLoop = now;
-      
-          if (xSemaphoreTake(modem_mutex, pdMS_TO_TICKS(500))) {
-        if (!mqtt.connected()) {
-          bool gprs = modem.isGprsConnected();
-          if (gprs) {
-            debugLog("[核心 1]", "MQTT 嘗試連接", "4G 已就緒");
-            bool mqttResult = mqtt.connect("ESP32_550_Carrier");
-            if (mqttResult) debugLog("[核心 1]", "MQTT", "連接成功");
-            else debugLog("[核心 1]", "MQTT", "連接失敗");
-          } else {
-            debugLog("[核心 1]", "MQTT 嘗試連接", "4G 尚未連接");
+
+    // ⏱️ WebSocket 事件與連線維護
+    if (now - lastWebSocketLoop > 100) {
+      lastWebSocketLoop = now;
+      if (xSemaphoreTake(modem_mutex, pdMS_TO_TICKS(500))) {
+        if (modem.isGprsConnected()) {
+          if (!webSocket.isConnected()) {
+            debugLog("[核心 1]", "WebSocket", "嘗試連線");
+            webSocket.beginSSL(wsHost, wsPort, wsPath);
           }
+          webSocket.loop();
+          if (!lastWebSocketConnected && webSocket.isConnected()) {
+            debugLog("[核心 1]", "WebSocket", "已連線");
+          }
+          lastWebSocketConnected = webSocket.isConnected();
+          webSocketConnectedState = lastWebSocketConnected;
         } else {
-          if (!lastMqttConnected) debugLog("[核心 1]", "MQTT 狀態", "已連接");
-          mqtt.loop();  // 只在連接時才呼叫
+          if (lastWebSocketConnected) {
+            debugLog("[核心 1]", "WebSocket", "已斷線");
+          }
+          lastWebSocketConnected = false;
+          webSocketConnectedState = false;
         }
-        lastMqttConnected = mqtt.connected();
-        mqttConnectedState = lastMqttConnected;
         gprsConnectedState = modem.isGprsConnected();
         xSemaphoreGive(modem_mutex);
       } else {
         debugLog("[核心 1]", "modem_mutex", "取鎖失敗");
       }
     }
-    
+
+    if (now - lastWebSocketTime >= 1000 && drone_data.fix) {
+      if (xSemaphoreTake(modem_mutex, pdMS_TO_TICKS(500))) {
+        if (webSocket.isConnected()) {
+          char payload[256];
+          snprintf(payload, sizeof(payload),
+                   "{\"lat\":%.7f,\"lon\":%.7f,\"sats\":%d,\"roll\":%.1f,\"pitch\":%.1f,\"yaw\":%.1f,\"vol\":%.1f,\"alt\":%.1f,\"vspd\":%.2f,\"fs\":%d}",
+                   drone_data.lat / 10000000.0, drone_data.lon / 10000000.0,
+                   drone_data.numSat, drone_data.roll, drone_data.pitch, drone_data.yaw,
+                   drone_data.voltage, drone_data.altitude_m, drone_data.vertical_speed,
+                   isInFailsafe ? 1 : 0);
+          webSocket.sendTXT(payload);
+        }
+        xSemaphoreGive(modem_mutex);
+      }
+      lastWebSocketTime = now;
+    }
+
     if (xSemaphoreTake(modem_mutex, 0)) {
       bool gprsNow = modem.isGprsConnected();
       if (gprsNow != lastGprsConnected) {
@@ -192,8 +242,9 @@ void core1_modem_task(void* pvParameters) {
 void setup() {
   Serial.begin(115200);
   
-  // 建立互斥鎖用於保護 Modem/MQTT 操作
+  // 建立互斥鎖用於保護 Modem/WebSocket 操作
   modem_mutex = xSemaphoreCreateMutex();
+  data_mutex = xSemaphoreCreateMutex();
   
   pixels.begin();
   pixels.setBrightness(100); 
@@ -223,9 +274,16 @@ void setup() {
 
   Serial.println("正在初始化 4G 模組...");
   modem.init();
-  mqtt.setServer(broker, 1883);
+#ifdef HAS_TINY_GSM_SECURE
+  secureClient.setInsecure();
+  webSocket.setSocketClient(&secureClient);
+#else
+  debugLog("[核心 1]","TinyGSM","TinyGsmClientSecure.h not found — using fallback client");
+#endif
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(5000);
   
-  // 🚀 在核心 1 啟動 4G/MQTT 背景任務
+  // 🚀 在核心 1 啟動 4G/WebSocket 背景任務
   xTaskCreatePinnedToCore(
     core1_modem_task,      // 函數
     "ModemTask",           // 名稱
@@ -321,8 +379,8 @@ void loop() {
     lastRcTime = now;
   }
 
-  // --- [任務 3] 完全移除 - 4G/MQTT 現在在核心 1 獨立執行 ---
-  // ❌ 不要在這裡呼叫 mqtt.loop()，會導致竞態條件！只在核心 1 呼叫
+  // --- [任務 3] 完全移除 - 4G/WebSocket 現在在核心 1 獨立執行 ---
+  // ❌ 不要在這裡呼叫 websocket.loop()，會導致竞態條件！只在核心 1 呼叫
   
   // ❌ 已移到核心 1，此處保持空白
 
@@ -343,24 +401,6 @@ void loop() {
 
   handleMspResponse();
 
-  // --- [任務 5] 每秒發布 MQTT 數據 (帶鎖保護) ---
-  if (now - lastMqttTime >= 1000 && drone_data.fix) {
-    if (xSemaphoreTake(modem_mutex, pdMS_TO_TICKS(100))) {  // 保護 mqtt.publish 使用 modem
-      if (mqtt.connected()) {
-        char payload[256];
-        snprintf(payload, sizeof(payload), 
-                 "{\"lat\":%.7f,\"lon\":%.7f,\"sats\":%d,\"roll\":%.1f,\"pitch\":%.1f,\"yaw\":%.1f,\"vol\":%.1f,\"alt\":%.1f,\"vspd\":%.2f,\"fs\":%d}",
-                 drone_data.lat / 10000000.0, drone_data.lon / 10000000.0, 
-                 drone_data.numSat, drone_data.roll, drone_data.pitch, drone_data.yaw,
-                 drone_data.voltage, drone_data.altitude_m, drone_data.vertical_speed,
-                 isInFailsafe ? 1 : 0);
-        mqtt.publish(topic, payload);
-      }
-      xSemaphoreGive(modem_mutex);
-      lastMqttTime = now;
-    }
-  }
-
   // --- [任務 6] 🔍 新增：每秒在序列埠印出 NRF 連線狀態 + Failsafe狀態 ---
   if (now - lastDebugPrintTime >= 1000) {
     Serial.print("["); Serial.print(now); Serial.print("] ");
@@ -377,7 +417,7 @@ void loop() {
   }
 
   // --- [任務 7] 🌈 RGB 戰術狀態指示燈 (安全存取狀態) ---
-  bool mqtt_connected_now = mqttConnectedState;
+  bool websocket_connected_now = webSocketConnectedState;
   bool modem_connected_now = gprsConnectedState;
   
   if (isInFailsafe) {
@@ -388,7 +428,7 @@ void loop() {
     // 訊號丟失: 紅色快速閃爍
     if ((now / 50) % 2 == 0) pixels.setPixelColor(0, pixels.Color(255, 0, 0)); 
     else pixels.setPixelColor(0, pixels.Color(0, 0, 0));   
-  } else if (!modem_connected_now || !mqtt_connected_now) {
+  } else if (!modem_connected_now || !websocket_connected_now) {
     // 網絡斷線: 黃色緩慢閃爍
     if ((now / 500) % 2 == 0) pixels.setPixelColor(0, pixels.Color(255, 200, 0)); 
     else pixels.setPixelColor(0, pixels.Color(0, 0, 0));     

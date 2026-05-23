@@ -2,9 +2,11 @@
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const http = require('http');
+const path = require('path');
 
 // 2. 建立 Express 網頁伺服器
 const app = express();
+app.use(express.static(path.join(__dirname, 'public')));
 const server = http.createServer(app);
 
 // 3. 建立 WebSocket 伺服器 (附著在同一個 port 上)
@@ -40,10 +42,6 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-// 提供一個簡單的首頁，證明 Render 有在運作
-app.get('/', (req, res) => {
-    res.send('550 空母戰情室 WebSocket Server 運作中 🚀');
-});
 
 // Render 會提供 process.env.PORT，沒有的話預設用 3000
 const PORT = process.env.PORT || 3000;
