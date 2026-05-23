@@ -1,0 +1,6 @@
+# 忽略所有子資料夾內的 Node.js 套件包
+**/node_modules/
+
+# 忽略 VS Code 的設定檔與暫存檔
+.vscode/
+.DS_Store
