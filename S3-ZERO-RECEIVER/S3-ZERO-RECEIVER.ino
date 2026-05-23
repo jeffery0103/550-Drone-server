@@ -48,7 +48,7 @@ struct __attribute__((packed)) Feedback_Packet {
 
 struct {
   uint8_t  fix; uint8_t  numSat; int32_t  lat; int32_t  lon;             
-  float    roll; float    pitch; float    voltage; float    altitude_m;      
+  float    roll; float    pitch; float    yaw; float    voltage; float    altitude_m;      
   float    vertical_speed;  
 } drone_data;
 
@@ -347,12 +347,13 @@ void loop() {
   if (now - lastMqttTime >= 1000 && drone_data.fix) {
     if (xSemaphoreTake(modem_mutex, pdMS_TO_TICKS(100))) {  // 保護 mqtt.publish 使用 modem
       if (mqtt.connected()) {
-        char payload[128];
+        char payload[256];
         snprintf(payload, sizeof(payload), 
-                 "{\"lat\":%.7f,\"lon\":%.7f,\"sats\":%d,\"roll\":%.1f,\"pitch\":%.1f,\"vol\":%.1f,\"alt\":%.1f}",
+                 "{\"lat\":%.7f,\"lon\":%.7f,\"sats\":%d,\"roll\":%.1f,\"pitch\":%.1f,\"yaw\":%.1f,\"vol\":%.1f,\"alt\":%.1f,\"vspd\":%.2f,\"fs\":%d}",
                  drone_data.lat / 10000000.0, drone_data.lon / 10000000.0, 
-                 drone_data.numSat, drone_data.roll, drone_data.pitch,
-                 drone_data.voltage, drone_data.altitude_m);
+                 drone_data.numSat, drone_data.roll, drone_data.pitch, drone_data.yaw,
+                 drone_data.voltage, drone_data.altitude_m, drone_data.vertical_speed,
+                 isInFailsafe ? 1 : 0);
         mqtt.publish(topic, payload);
       }
       xSemaphoreGive(modem_mutex);
@@ -480,6 +481,7 @@ void handleMspResponse() {
           } else if (msp_rx_cmd == 108 && msp_rx_size == 6) {
             drone_data.roll  = ((int16_t)(msp_rx_payload[1] << 8 | msp_rx_payload[0])) / 10.0;
             drone_data.pitch = ((int16_t)(msp_rx_payload[3] << 8 | msp_rx_payload[2])) / 10.0;
+            drone_data.yaw   = ((int16_t)(msp_rx_payload[5] << 8 | msp_rx_payload[4])) / 10.0;
           } else if (msp_rx_cmd == 110 && msp_rx_size >= 7) {
             drone_data.voltage = msp_rx_payload[0] / 10.0;
           } else if (msp_rx_cmd == 109 && msp_rx_size >= 6) {

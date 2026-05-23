@@ -10,6 +10,14 @@ const server = http.createServer(app);
 // 3. 建立 WebSocket 伺服器 (附著在同一個 port 上)
 const wss = new WebSocketServer({ server });
 
+function broadcastTelemetry(dataStr) {
+    wss.clients.forEach(function each(client) {
+        if (client.readyState === 1 /* OPEN */) {
+            client.send(dataStr);
+        }
+    });
+}
+
 // 4. 當有人連上 WebSocket 時 (可能是 ESP32，也可能是你的網頁)
 wss.on('connection', (ws, req) => {
     console.log('有新裝置連線了！來源:', req.socket.remoteAddress);
